@@ -56,37 +56,89 @@ class Transaction {
       .digest('hex');
   }
 
-  signTransaction(signingKey) {
-    if (signingKey.getPublic('hex') !== this.fromAddress) {
-      throw new Error('You cannot sign transactions for other wallets!');
+  /**
+   * signTransaction — signs this transaction with the sender's private key
+   *
+   * The original code used elliptic library methods (.getPublic(), .sign(), .toDER())
+   * which don't exist in Node.js built-in crypto. Replaced entirely with
+   * crypto.sign() which is native to Node.js — no extra dependencies needed.
+   *
+   * Why sha256? It produces a fixed 32-byte hash regardless of transaction size.
+   * That hash is what we actually sign — not the raw transaction data.
+   * This is exactly how Bitcoin signs transactions under the hood.
+   *
+   * @param {string} privateKeyPem - the sender's private key in PEM/pkcs8 format
+   * @param {string} publicKeyPem - the sender's public key in PEM/spki format
+   */
+  signTransaction(privateKeyPem, publicKeyPem) {
+    // A transaction can only be signed by its sender — reject if public keys don't match
+    if (publicKeyPem !== this.fromAddress) {
+      throw new Error(
+        'You cannot sign transactions for other wallets — public key mismatch'
+      );
     }
 
+    // Hash the transaction data first — we sign the hash, not the raw data
+    // This is standard practice: signing raw data directly is slower and less secure
     const hashTx = this.calculateHash();
-    const sig = signingKey.sign(hashTx, 'base64');
-    this.signature = sig.toDER('hex');
+
+    // crypto.sign() uses the private key to produce a digital signature
+    // 'sha256' tells Node.js to apply SHA-256 during the signing operation
+    // The result is a Buffer — we store it as hex string for easy serialisation
+    this.signature = crypto
+      .sign('sha256', Buffer.from(hashTx), privateKeyPem)
+      .toString('hex');
   }
 
+  /**
+   * isValid — verifies this transaction has a legitimate cryptographic signature
+   *
+   * The original code had a critical security bypass:
+   *   if (!this.signature || this.signature.length === 0) return true
+   * This allowed ANY unsigned transaction to pass validation — a serious flaw
+   * in a system handling real digital assets.
+   *
+   * Mining reward transactions (fromAddress === null) are the only legitimate
+   * exception — they are created by the blockchain itself, not by a user wallet.
+   *
+   * @returns {boolean} true only if signature is valid, false otherwise
+   */
   isValid() {
+    // Mining reward transactions have no sender — they are issued by the blockchain
+    // itself as compensation for the computational work of mining a block.
+    // These are the ONLY transactions allowed without a signature.
     if (this.fromAddress === null) return true;
 
+    // Every other transaction MUST have a signature — no exceptions.
+    // The original code returned true here which defeated the entire security model.
     if (!this.signature || this.signature.length === 0) {
-      return true;
+      throw new Error(
+        'Transaction has no signature — unsigned transactions are rejected'
+      );
     }
 
     try {
+      // Reconstruct the public key from PEM format stored in fromAddress
+      // spki = SubjectPublicKeyInfo, the standard format we used when generating
+      // the key pair in wallet.controller.js
       const publicKey = crypto.createPublicKey({
-        key: Buffer.from(this.fromAddress, 'hex'),
-        format: 'der',
+        key: this.fromAddress,
+        format: 'pem',
         type: 'spki',
       });
 
+      // crypto.verify() mathematically checks that the signature was produced
+      // by the private key that corresponds to this public key.
+      // If anyone tampered with the transaction data, this returns false.
       return crypto.verify(
-        null,
+        'sha256',
         Buffer.from(this.calculateHash()),
         publicKey,
         Buffer.from(this.signature, 'hex')
       );
     } catch {
+      // Any error during verification means the transaction is invalid —
+      // corrupted signature, wrong key format, or tampered data
       return false;
     }
   }
@@ -123,11 +175,22 @@ class Blockchain {
     this.pendingTransactions = [];
   }
 
+  /**
+   * addTransaction — validates and queues a transaction for the next block
+   *
+   * Rejects any transaction that fails cryptographic validation.
+   * This is the enforcement point — no unsigned or tampered transaction
+   * ever reaches the chain. Think of this as the bouncer at the door.
+   *
+   * @param {Transaction} transaction - the transaction to add
+   */
   addTransaction(transaction) {
     if (!transaction.fromAddress || !transaction.toAddress) {
       throw new Error('Transaction must include from and to address');
     }
 
+    // isValid() now properly verifies the cryptographic signature —
+    // the original bypass has been removed so this check is now real security
     if (!transaction.isValid()) {
       throw new Error('Cannot add invalid transaction to chain');
     }

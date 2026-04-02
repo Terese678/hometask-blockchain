@@ -1,4 +1,5 @@
-const { blockchain, Transaction } = require('../models');
+// Import saveChain so we can persist state after every new transaction
+const { blockchain, Transaction, saveChain } = require('../models');
 const { sendSuccess, sendCreated, sendError } = require('../utils/response');
 const { isValidAddress, isValidAmount, sanitizeAddress, sanitizeAmount } = require('../utils/validator');
 
@@ -21,6 +22,10 @@ const addTransaction = (req, res, next) => {
     );
 
     blockchain.addTransaction(transaction);
+
+    // Persist immediately after adding — if server restarts before mining,
+    // pending transactions are not lost. Every state change must survive restarts.
+    saveChain();
 
     sendCreated(res, {
       message: 'Transaction added to pending pool',

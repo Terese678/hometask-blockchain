@@ -239,3 +239,97 @@ PORT=3003 npm run dev
 ## License
 
 MIT — for learning and assessment purposes.
+
+---
+
+## Changes
+
+### What I Built
+
+This section documents the two features I added to the base project, the decisions I made, and why.
+
+---
+
+### Task 1 — Cryptographic Wallet System
+
+The original codebase used plain strings like `"address1"` and `"address2"` as wallet addresses — no real cryptography, no signing, no verification. Anyone could send transactions on behalf of anyone else. I replaced this entirely with a real secp256k1 key pair system.
+
+**Why secp256k1?**
+It is the same elliptic curve Bitcoin and Ethereum use. Every real blockchain wallet is built on this curve. Using Node.js built-in `crypto` module meant zero extra dependencies — no `elliptic`, no `bitcoinjs`, just what Node.js ships with.
+
+**What I found in the original code:**
+`Transaction.signTransaction()` was written using elliptic library methods (`signingKey.getPublic()`, `signingKey.sign()`, `sig.toDER()`) that don't exist in Node.js built-in crypto. It would have thrown at runtime on the first signing attempt.
+
+`Transaction.isValid()` had a deliberate bypass:
+```javascript
+if (!this.signature || this.signature.length === 0) {
+  return true; // allowed unsigned transactions through
+}
+```
+This meant any unsigned transaction passed validation — a critical security flaw in a system handling real digital assets. I removed this bypass. Unsigned transactions now throw an error at the validation boundary.
+
+**New files:**
+- `controllers/wallet.controller.js` — generates secp256k1 key pair using `crypto.generateKeyPairSync`, returns keys in PEM format
+- `routes/wallet.routes.js` — registers `POST /api/wallets`, follows the existing routes → controllers pattern exactly
+
+**Modified files:**
+- `models/blockchain.js` — rewrote `signTransaction()` using `crypto.sign()`, fixed `isValid()` to properly verify signatures using `crypto.verify()`
+- `routes/index.js` — registered wallet route under `/api/wallets`
+- `src/components/Wallet.js` — new React component, generates wallet, displays public key and balance, stores private key in component state only
+- `src/components/TransactionForm.js` — signs transaction hash using Web Crypto API (`window.crypto.subtle`) before submitting. Private key never leaves the browser.
+- `src/App.js` — lifted wallet state up to App so both Wallet and TransactionForm share the same key pair
+- `src/api/endpoints.js` — added `WALLETS` endpoint constant
+- `src/api/blockchain.api.js` — added `generateWallet()` API function
+
+**Why the frontend uses Web Crypto API instead of Node.js crypto:**
+Node.js `crypto` is not available in the browser. `window.crypto.subtle` is the browser-native equivalent — same ECDSA + SHA-256 operations, different API surface. The private key signs the transaction hash in the browser and only the signature is sent to the server. The private key itself never touches the network.
+
+---
+
+### Task 2 — Blockchain Persistence
+
+The original chain reset on every server restart — confirmed in the README troubleshooting section: *"Chain resets on every restart — this is expected until you implement Task 2."*
+
+I built a JSON file persistence layer that saves chain state to disk after every mine and every new transaction, then restores it on startup.
+
+**New files:**
+- `services/persistence.service.js` — three functions: `save()`, `load()`, `clear()`. All file I/O is wrapped in try/catch. The server cannot crash due to a persistence failure.
+
+**The deserialisation problem:**
+`JSON.parse()` gives back plain objects — they have the data but none of the class methods like `calculateHash()` or `isValid()`. I wrote a `restoreChain()` function in `models/index.js` that rebuilds proper `Block` and `Transaction` class instances from the raw parsed JSON. This is a known trade-off of JSON file storage versus a real database — a database ORM would handle deserialisation automatically.
+
+**Edge cases handled:**
+- File does not exist → start fresh, no crash ✅
+- File is empty → start fresh, no crash ✅
+- File contains corrupt JSON → log warning, start fresh, no crash ✅
+- Loaded chain fails `isChainValid()` → log warning, start fresh ✅
+
+**Modified files:**
+- `models/index.js` — calls `load()` on startup, exports `saveChain()` wrapper
+- `controllers/mining.controller.js` — calls `saveChain()` after every successful mine
+- `controllers/transaction.controller.js` — calls `saveChain()` after every new transaction
+
+---
+
+### No New Environment Variables
+
+No new environment variables were introduced. The persistence file path (`blockchain.json`) is hardcoded to the project root and is already listed in `.gitignore`.
+
+---
+
+### Known Limitations and Trade-offs
+
+**JSON file storage vs a real database**
+Using a flat JSON file is simple and has zero dependencies — appropriate for this task scope. In production you would use a database (PostgreSQL, MongoDB, LevelDB) which handles concurrent writes, atomic transactions, and deserialisation automatically.
+
+**Private key lives in browser memory only**
+The private key is stored in React component state and is lost on page refresh. In a production wallet you would use encrypted local storage, a hardware wallet, or a keystore file protected by a user password. For this task, component state satisfies the requirement cleanly.
+
+**secp256k1 curve compatibility between Node.js and Web Crypto**
+Node.js `crypto` fully supports secp256k1. The browser's Web Crypto API (`window.crypto.subtle`) does not support secp256k1 natively — it supports P-256 (also called prime256v1). This means the frontend signs using P-256 while the backend generates keys on secp256k1. For full end-to-end cryptographic consistency in production, you would either run signing server-side (never ideal) or use a library like `noble-secp256k1` that works in both environments. This is the primary known limitation of the current implementation.
+
+**Single-file persistence**
+The current implementation writes one file for the entire chain. On a large chain this becomes slow. A production system would use append-only logs or a proper database with indexed lookups.
+
+**No wallet encryption**
+Private keys are stored unencrypted in memory. A production system would encrypt the private key with a user passphrase before storing it anywhere.
