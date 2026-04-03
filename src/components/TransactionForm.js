@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import './TransactionForm.css';
 import { addTransaction } from '../api/blockchain.api';
 
@@ -79,6 +79,15 @@ const TransactionForm = ({ onTransactionAdded, privateKey, publicKey }) => {
   });
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
+
+  // When publicKey prop changes after wallet generation, auto-fill fromAddress.
+  // useState initial value only runs once on mount — useEffect watches for changes.
+  // This is the standard React pattern for syncing props into local state.
+  useEffect(() => {
+    if (publicKey) {
+      setFormData(prev => ({ ...prev, fromAddress: publicKey }));
+    }
+  }, [publicKey]);
 
   const handleChange = (e) => {
     setFormData({ ...formData, [e.target.name]: e.target.value });
