@@ -5,7 +5,9 @@ const { isValidAddress, isValidAmount, sanitizeAddress, sanitizeAmount } = requi
 
 const addTransaction = (req, res, next) => {
   try {
-    const { fromAddress, toAddress, amount } = req.body;
+    // Extract signature alongside the other fields — the frontend signs
+    // the transaction before submitting so the signature arrives in the body
+    const { fromAddress, toAddress, amount, signature } = req.body;
 
     if (!isValidAddress(fromAddress) || !isValidAddress(toAddress)) {
       return sendError(res, 'Invalid wallet address format', 400);
@@ -20,6 +22,12 @@ const addTransaction = (req, res, next) => {
       sanitizeAddress(toAddress),
       sanitizeAmount(amount)
     );
+
+    // Attach the signature the frontend produced before calling isValid()
+    // Without this, the transaction object has an empty signature and gets rejected
+    if (signature) {
+      transaction.signature = signature;
+    }
 
     blockchain.addTransaction(transaction);
 

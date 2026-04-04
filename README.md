@@ -252,10 +252,10 @@ This section documents the two features I added to the base project, the decisio
 
 ### Task 1 — Cryptographic Wallet System
 
-The original codebase used plain strings like `"address1"` and `"address2"` as wallet addresses — no real cryptography, no signing, no verification. Anyone could send transactions on behalf of anyone else. I replaced this entirely with a real secp256k1 key pair system.
+The original codebase used plain strings like `"address1"` and `"address2"` as wallet addresses — no real cryptography, no signing, no verification. Anyone could send transactions on behalf of anyone else. I replaced this entirely with a real cryptographic key pair system.
 
-**Why secp256k1?**
-It is the same elliptic curve Bitcoin and Ethereum use. Every real blockchain wallet is built on this curve. Using Node.js built-in `crypto` module meant zero extra dependencies — no `elliptic`, no `bitcoinjs`, just what Node.js ships with.
+**Why P-256?**
+P-256 (prime256v1) is supported by both Node.js built-in `crypto` AND the browser's Web Crypto API (`window.crypto.subtle`). secp256k1 is Bitcoin's curve but the browser does not support it natively — using P-256 gives full end-to-end consistency with zero extra dependencies. The instructions allow "ec type" and P-256 is a valid, widely used ec curve.
 
 **What I found in the original code:**
 `Transaction.signTransaction()` was written using elliptic library methods (`signingKey.getPublic()`, `signingKey.sign()`, `sig.toDER()`) that don't exist in Node.js built-in crypto. It would have thrown at runtime on the first signing attempt.
@@ -269,20 +269,20 @@ if (!this.signature || this.signature.length === 0) {
 This meant any unsigned transaction passed validation — a critical security flaw in a system handling real digital assets. I removed this bypass. Unsigned transactions now throw an error at the validation boundary.
 
 **New files:**
-- `controllers/wallet.controller.js` — generates secp256k1 key pair using `crypto.generateKeyPairSync`, returns keys in PEM format
+- `controllers/wallet.controller.js` — generates P-256 key pair using `crypto.generateKeyPairSync`, returns keys in PEM format
 - `routes/wallet.routes.js` — registers `POST /api/wallets`, follows the existing routes → controllers pattern exactly
 
 **Modified files:**
 - `models/blockchain.js` — rewrote `signTransaction()` using `crypto.sign()`, fixed `isValid()` to properly verify signatures using `crypto.verify()`
 - `routes/index.js` — registered wallet route under `/api/wallets`
 - `src/components/Wallet.js` — new React component, generates wallet, displays public key and balance, stores private key in component state only
-- `src/components/TransactionForm.js` — signs transaction hash using Web Crypto API (`window.crypto.subtle`) before submitting. Private key never leaves the browser.
+- `src/components/TransactionForm.js` — signs transaction data using Web Crypto API (`window.crypto.subtle`) before submitting. Converts signature from P1363 to DER format before sending. Private key never leaves the browser.
 - `src/App.js` — lifted wallet state up to App so both Wallet and TransactionForm share the same key pair
 - `src/api/endpoints.js` — added `WALLETS` endpoint constant
 - `src/api/blockchain.api.js` — added `generateWallet()` API function
 
 **Why the frontend uses Web Crypto API instead of Node.js crypto:**
-Node.js `crypto` is not available in the browser. `window.crypto.subtle` is the browser-native equivalent — same ECDSA + SHA-256 operations, different API surface. The private key signs the transaction hash in the browser and only the signature is sent to the server. The private key itself never touches the network.
+Node.js `crypto` is not available in the browser. `window.crypto.subtle` is the browser-native equivalent — same ECDSA + SHA-256 operations, different API surface. The private key signs the transaction data in the browser and only the signature is sent to the server. The private key itself never touches the network.
 
 ---
 
@@ -325,8 +325,11 @@ Using a flat JSON file is simple and has zero dependencies — appropriate for t
 **Private key lives in browser memory only**
 The private key is stored in React component state and is lost on page refresh. In a production wallet you would use encrypted local storage, a hardware wallet, or a keystore file protected by a user password. For this task, component state satisfies the requirement cleanly.
 
-**secp256k1 curve compatibility between Node.js and Web Crypto**
-Node.js `crypto` fully supports secp256k1. The browser's Web Crypto API (`window.crypto.subtle`) does not support secp256k1 natively — it supports P-256 (also called prime256v1). This means the frontend signs using P-256 while the backend generates keys on secp256k1. For full end-to-end cryptographic consistency in production, you would either run signing server-side (never ideal) or use a library like `noble-secp256k1` that works in both environments. This is the primary known limitation of the current implementation.
+**Curve choice — P-256 over secp256k1**
+The backend generates keys using P-256 (prime256v1) rather than secp256k1. While secp256k1 is Bitcoin's curve, it is not supported by the browser's Web Crypto API (`window.crypto.subtle`). P-256 is supported universally — in Node.js built-in crypto and in all modern browsers — giving full end-to-end consistency. The instructions allow "ec type" and P-256 is a valid, widely used ec curve.
+
+**Signature format — P1363 to DER conversion**
+Web Crypto API produces ECDSA signatures in IEEE P1363 format (raw 64-byte r||s). Node.js `crypto.verify` expects ASN.1 DER format. The `p1363ToDer` function in `TransactionForm.js` handles this conversion before the signature is sent to the backend — without it, verification always fails even when the signature is cryptographically correct.
 
 **Single-file persistence**
 The current implementation writes one file for the entire chain. On a large chain this becomes slow. A production system would use append-only logs or a proper database with indexed lookups.

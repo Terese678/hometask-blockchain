@@ -6,10 +6,6 @@ import { addTransaction } from '../api/blockchain.api';
  * importPrivateKey — converts a PEM private key string into a CryptoKey
  * that the browser's Web Crypto API can use for signing.
  *
- * Why Web Crypto API? Node.js crypto is not available in the browser.
- * Web Crypto (window.crypto.subtle) is the browser-native equivalent —
- * same cryptographic operations, different API.
- *
  * @param {string} pem - private key in PEM/pkcs8 format
  * @returns {Promise<CryptoKey>}
  */
@@ -32,29 +28,64 @@ const importPrivateKey = async (pem) => {
 };
 
 /**
- * signTransactionData — signs the transaction hash using the private key
- * with ECDSA + SHA-256, matching the verification in models/blockchain.js
+ * p1363ToDer — converts a Web Crypto ECDSA signature from IEEE P1363 format
+ * to DER format expected by Node.js crypto.verify.
  *
- * Why sign the hash and not raw data? Signing a fixed-size hash is faster
- * and more secure than signing variable-length raw transaction data.
- * This is exactly how Bitcoin signs transactions under the hood.
+ * Why is this needed? Web Crypto API produces signatures as raw r||s bytes
+ * (P1363 format — 64 bytes for P-256). Node.js crypto.verify expects the
+ * signature in ASN.1 DER format. Without this conversion, verification always
+ * fails even when the signature is cryptographically correct.
+ *
+ * @param {Uint8Array} p1363 - raw 64-byte signature from Web Crypto
+ * @returns {Uint8Array} DER-encoded signature
+ */
+const p1363ToDer = (p1363) => {
+  const r = p1363.slice(0, 32);
+  const s = p1363.slice(32);
+
+  // Prepend 0x00 if high bit is set to prevent sign misinterpretation in DER
+  const rPadded = r[0] & 0x80 ? new Uint8Array([0, ...r]) : r;
+  const sPadded = s[0] & 0x80 ? new Uint8Array([0, ...s]) : s;
+
+  const der = new Uint8Array(6 + rPadded.length + sPadded.length);
+  let i = 0;
+  der[i++] = 0x30; // SEQUENCE tag
+  der[i++] = 4 + rPadded.length + sPadded.length; // total length
+  der[i++] = 0x02; // INTEGER tag for r
+  der[i++] = rPadded.length;
+  der.set(rPadded, i); i += rPadded.length;
+  der[i++] = 0x02; // INTEGER tag for s
+  der[i++] = sPadded.length;
+  der.set(sPadded, i);
+
+  return der;
+};
+
+/**
+ * signTransactionData — signs transaction data using the private key with
+ * ECDSA + SHA-256, then converts the signature to DER format so Node.js
+ * crypto.verify can validate it on the backend.
  *
  * @param {string} privateKeyPem - sender's private key in PEM format
- * @param {string} hash - transaction data hash
- * @returns {Promise<string>} hex-encoded signature
+ * @param {string} data - raw transaction data string to sign
+ * @returns {Promise<string>} hex-encoded DER signature
  */
-const signTransactionData = async (privateKeyPem, hash) => {
+const signTransactionData = async (privateKeyPem, data) => {
   const key = await importPrivateKey(privateKeyPem);
-  const encoder = new TextEncoder();
-  const data = encoder.encode(hash);
+  const encoded = new TextEncoder().encode(data);
 
-  const signature = await window.crypto.subtle.sign(
-    { name: 'ECDSA', hash: { name: 'SHA-256' } },
-    key,
-    data
+  // Web Crypto returns P1363 format — must convert to DER for Node.js
+  const p1363 = new Uint8Array(
+    await window.crypto.subtle.sign(
+      { name: 'ECDSA', hash: { name: 'SHA-256' } },
+      key,
+      encoded
+    )
   );
 
-  return Array.from(new Uint8Array(signature))
+  const der = p1363ToDer(p1363);
+
+  return Array.from(der)
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
 };
@@ -62,10 +93,8 @@ const signTransactionData = async (privateKeyPem, hash) => {
 /**
  * TransactionForm — creates and signs a transaction before submitting
  *
- * Why sign in the frontend? The private key never leaves the client.
- * We sign the transaction hash here and send only the signature to
- * the backend — the private key itself never touches the server.
- * This is how real blockchain wallets work.
+ * The private key never leaves the client. We sign here and send only
+ * the DER-encoded signature to the backend for verification.
  *
  * @param {function} onTransactionAdded - callback after successful submission
  * @param {string} privateKey - sender's private key from Wallet component
@@ -80,12 +109,9 @@ const TransactionForm = ({ onTransactionAdded, privateKey, publicKey }) => {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
 
-  // When publicKey prop changes after wallet generation, auto-fill fromAddress.
-  // useState initial value only runs once on mount — useEffect watches for changes.
-  // This is the standard React pattern for syncing props into local state.
   useEffect(() => {
     if (publicKey) {
-      setFormData(prev => ({ ...prev, fromAddress: publicKey }));
+      setFormData(prev => ({ ...prev, fromAddress: publicKey.trim() }));
     }
   }, [publicKey]);
 
@@ -100,28 +126,29 @@ const TransactionForm = ({ onTransactionAdded, privateKey, publicKey }) => {
     setMessage('');
 
     try {
-      // Block submission if no wallet has been generated yet
       if (!privateKey) {
         setMessage('Please generate a wallet first before sending a transaction');
         setLoading(false);
         return;
       }
 
-      // Sign the transaction hash with the private key before submitting.
-      // The signature proves ownership of the wallet without revealing the private key.
-      // This is the same principle used in every real blockchain transaction.
-      const hash = `${formData.fromAddress}${formData.toAddress}${formData.amount}`;
-      const signature = await signTransactionData(privateKey, hash);
+      // Trim fromAddress — sanitizeAddress on the backend calls .trim(),
+      // so both sides must operate on the exact same string when signing
+      const trimmedFrom = formData.fromAddress.trim();
+
+      // Sign raw concatenated fields — backend verifies the same string
+      const dataToSign = `${trimmedFrom}${formData.toAddress}${formData.amount}`;
+      const signature = await signTransactionData(privateKey, dataToSign);
 
       await addTransaction(
-        formData.fromAddress,
+        trimmedFrom,
         formData.toAddress,
         formData.amount,
         signature
       );
 
       setMessage('Transaction added successfully!');
-      setFormData({ fromAddress: publicKey || '', toAddress: '', amount: '' });
+      setFormData({ fromAddress: publicKey.trim() || '', toAddress: '', amount: '' });
       onTransactionAdded();
     } catch (err) {
       setMessage(err.message || 'Failed to add transaction');
@@ -194,7 +221,6 @@ const TransactionForm = ({ onTransactionAdded, privateKey, publicKey }) => {
           {loading ? 'Signing & Sending...' : 'Sign & Send Transaction'}
         </button>
 
-        {/* Inform user they need a wallet before transacting */}
         {!privateKey && (
           <p style={{ fontSize: '12px', color: '#888', marginTop: '8px' }}>
             Generate a wallet above to enable transactions
